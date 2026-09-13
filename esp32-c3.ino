@@ -1,5 +1,4 @@
-// ESP32-C3 设备信息云同步固件（Arduino-ESP32）
-// 需要安装 ArduinoJson 和 PubSubClient；其余库随 Arduino-ESP32 提供。
+// ESP32-C3 离线设备信息交换固件（Arduino-ESP32）
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEAdvertising.h>
@@ -14,7 +13,9 @@
 constexpr char MQTT_HOST[] = "broker.emqx.io";
 constexpr uint16_t MQTT_PORT = 1883;
 constexpr uint32_t BLE_SCAN_INTERVAL_MS = 60000;
+
 constexpr uint8_t MAX_NEARBY_DEVICES = 50;
+constexpr uint8_t MAX_SAVED_NEARBY_DEVICES = 10;
 constexpr uint32_t NEARBY_DEVICE_TIMEOUT_MS = 120000;
 constexpr uint32_t ESP_NOW_INTERVAL_MS = 10000;
 constexpr uint8_t ESP_NOW_CHANNEL = 6;
@@ -28,7 +29,9 @@ BLEScan* bleScan = nullptr;
 BLEAdvertising* bleAdvertising = nullptr;
 
 String deviceId;
+String name;
 String nickname;
+String bio;
 String note;
 String statusText;
 String qq;
@@ -46,7 +49,9 @@ struct EspNowProfile {
 	uint8_t magic;
 	uint8_t version;
 	char deviceId[32];
+	char name[48];
 	char nickname[48];
+	char bio[128];
 	char status[32];
 	char note[96];
 	char qq[20];
@@ -58,7 +63,9 @@ uint8_t espNowBroadcastAddress[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 struct NearbyDevice {
 	String deviceId;
+	String name;
 	String nickname;
+	String bio;
 	String status;
 	String note;
 	String qq;
@@ -67,6 +74,39 @@ struct NearbyDevice {
 };
 
 NearbyDevice nearbyDevices[MAX_NEARBY_DEVICES];
+
+String nearbyKey(uint8_t index, const char* field) {
+	return "n" + String(index) + field;
+}
+
+void saveNearbyDevice(uint8_t index) {
+	if (index >= MAX_SAVED_NEARBY_DEVICES || nearbyDevices[index].deviceId.isEmpty()) return;
+	NearbyDevice& nearby = nearbyDevices[index];
+	preferences.putString(nearbyKey(index, "id").c_str(), nearby.deviceId);
+	preferences.putString(nearbyKey(index, "name").c_str(), nearby.name);
+	preferences.putString(nearbyKey(index, "nick").c_str(), nearby.nickname);
+	preferences.putString(nearbyKey(index, "bio").c_str(), nearby.bio);
+	preferences.putString(nearbyKey(index, "stat").c_str(), nearby.status);
+	preferences.putString(nearbyKey(index, "note").c_str(), nearby.note);
+	preferences.putString(nearbyKey(index, "qq").c_str(), nearby.qq);
+	preferences.putString(nearbyKey(index, "wx").c_str(), nearby.wx);
+}
+
+void loadNearbyDevices() {
+	for (uint8_t index = 0; index < MAX_SAVED_NEARBY_DEVICES; index++) {
+		NearbyDevice& nearby = nearbyDevices[index];
+		nearby.deviceId = preferences.getString(nearbyKey(index, "id").c_str(), "");
+		if (nearby.deviceId.isEmpty()) continue;
+		nearby.name = preferences.getString(nearbyKey(index, "name").c_str(), "");
+		nearby.nickname = preferences.getString(nearbyKey(index, "nick").c_str(), "");
+		nearby.bio = preferences.getString(nearbyKey(index, "bio").c_str(), "");
+		nearby.status = preferences.getString(nearbyKey(index, "stat").c_str(), "");
+		nearby.note = preferences.getString(nearbyKey(index, "note").c_str(), "");
+		nearby.qq = preferences.getString(nearbyKey(index, "qq").c_str(), "");
+		nearby.wx = preferences.getString(nearbyKey(index, "wx").c_str(), "");
+		nearby.lastSeen = millis();
+	}
+}
 
 String jsonEscape(const String& value) {
 	String escaped = value;
@@ -82,7 +122,18 @@ String htmlEscape(const String& value) {
 	escaped.replace("<", "&lt;");
 	escaped.replace(">", "&gt;");
 	escaped.replace("\"", "&quot;");
+	escaped.replace("'", "&#39;");
 	return escaped;
+}
+
+String configInput(const String& label, const String& field, const String& value, const String& type = "text") {
+	return "<form method='post' action='/api/config'><label>" + label + "</label><input name='" + field +
+		"' type='" + type + "' value='" + htmlEscape(value) + "'><button type='submit'>保存</button></form>";
+}
+
+String configTextarea(const String& label, const String& field, const String& value) {
+	return "<form method='post' action='/api/config'><label>" + label + "</label><textarea name='" + field +
+		"'>" + htmlEscape(value) + "</textarea><button type='submit'>保存</button></form>";
 }
 
 void loadSettings() {
@@ -94,7 +145,9 @@ void loadSettings() {
 	}
 	wifiSsid = preferences.getString("ssid", "");
 	wifiPassword = preferences.getString("password", "");
+	name = preferences.getString("name", "未命名设备");
 	nickname = preferences.getString("nickname", "未命名设备");
+	bio = preferences.getString("bio", "");
 	note = preferences.getString("note", "");
 	statusText = preferences.getString("status", "远征");
 	qq = preferences.getString("qq", "1811610638");
@@ -110,10 +163,13 @@ void loadSettings() {
 	preferences.putString("status", statusText);
 	preferences.putString("qq", qq);
 	preferences.putString("wx", wx);
+	loadNearbyDevices();
 }
 
 void saveProfile() {
+	preferences.putString("name", name);
 	preferences.putString("nickname", nickname);
+	preferences.putString("bio", bio);
 	preferences.putString("note", note);
 	preferences.putString("status", statusText);
 	preferences.putString("qq", qq);
@@ -126,7 +182,8 @@ void sendJson(int code, const String& body) {
 }
 
 String profileJson(bool includeNearby = false) {
-	String body = "{\"deviceId\":\"" + jsonEscape(deviceId) + "\",\"nickname\":\"" + jsonEscape(nickname) +
+	String body = "{\"deviceId\":\"" + jsonEscape(deviceId) + "\",\"name\":\"" + jsonEscape(name) +
+		"\",\"nickname\":\"" + jsonEscape(nickname) + "\",\"bio\":\"" + jsonEscape(bio) +
 		"\",\"note\":\"" + jsonEscape(note) + "\",\"status\":\"" + jsonEscape(statusText) +
 		"\",\"qq\":\"" + jsonEscape(qq) + "\",\"wx\":\"" + jsonEscape(wx) +
 		"\",\"online\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
@@ -137,8 +194,9 @@ String profileJson(bool includeNearby = false) {
 			if (nearby.deviceId.isEmpty()) continue;
 			if (!firstDevice) body += ',';
 			firstDevice = false;
-			body += "{\"deviceId\":\"" + jsonEscape(nearby.deviceId) + "\",\"nickname\":\"" +
-				jsonEscape(nearby.nickname) + "\",\"note\":\"" + jsonEscape(nearby.note) +
+			body += "{\"deviceId\":\"" + jsonEscape(nearby.deviceId) + "\",\"name\":\"" +
+				jsonEscape(nearby.name) + "\",\"nickname\":\"" + jsonEscape(nearby.nickname) +
+				"\",\"bio\":\"" + jsonEscape(nearby.bio) + "\",\"note\":\"" + jsonEscape(nearby.note) +
 				"\",\"status\":\"" + jsonEscape(nearby.status) + "\",\"qq\":\"" +
 				jsonEscape(nearby.qq) + "\",\"wx\":\"" + jsonEscape(nearby.wx) + "\"}";
 		}
@@ -154,7 +212,7 @@ void handleRoot() {
 	for (const NearbyDevice& nearby : nearbyDevices) {
 		if (nearby.deviceId.isEmpty()) continue;
 		hasNearbyDevice = true;
-		nearbyHtml += "<p><strong>" + htmlEscape(nearby.nickname.isEmpty() ? nearby.deviceId : nearby.nickname) +
+		nearbyHtml += "<p><strong>" + htmlEscape(nearby.name.isEmpty() ? (nearby.nickname.isEmpty() ? nearby.deviceId : nearby.nickname) : nearby.name) +
 			"</strong><br>设备 ID：" + htmlEscape(nearby.deviceId) +
 			"<br>状态：<span>" + htmlEscape(nearby.status) + "</span></p>";
 	}
@@ -166,28 +224,43 @@ void handleRoot() {
 		"input,textarea{box-sizing:border-box;width:100%;padding:10px;margin:5px 0 12px}button{padding:10px 18px}</style>"
 		"<h2>设备信息</h2><section><dl>"
 		"<dt>设备 ID</dt><dd>" + htmlEscape(deviceId) + "</dd>"
+		"<dt>名称</dt><dd>" + htmlEscape(name) + "</dd>"
+		"<dt>个人简介</dt><dd>" + htmlEscape(bio) + "</dd>"
 		"<dt>状态</dt><dd>" + htmlEscape(statusText) + "</dd>"
 		"<dt>QQ</dt><dd>" + htmlEscape(qq) + "</dd>"
 		"<dt>微信</dt><dd>" + htmlEscape(wx) + "</dd>"
 		"</dl></section>" + nearbyHtml +
-		"<h2>设备配置</h2><form method='post' action='/api/config'>"
-		"<label>WiFi 名称</label><input name='ssid' required><label>WiFi 密码</label><input name='password' type='password'>"
-		"<label>昵称</label><input name='nickname'><label>备注</label><textarea name='note'></textarea>"
-		"<label>自定义状态</label><input name='status'><label>QQ</label><input name='qq'>"
-		"<label>微信</label><input name='wx'><button>保存并重启</button></form>";
+		"<h2>设备配置</h2>" + configInput("WiFi 名称", "ssid", wifiSsid) +
+		configInput("WiFi 密码", "password", "", "password") + configInput("名称", "name", name) +
+		configInput("昵称", "nickname", nickname) + configTextarea("个人简介", "bio", bio) +
+		configTextarea("备注", "note", note) +
+		configInput("自定义状态", "status", statusText) + configInput("QQ", "qq", qq) +
+		configInput("微信", "wx", wx) +
+		"<form method='post' action='/api/reset-wlan' onsubmit=\"return confirm('确定清除 WLAN 配置？')\">"
+		"<button type='submit'>重置 WLAN 配置</button></form>";
 	server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleConfig() {
 	if (server.hasArg("ssid")) preferences.putString("ssid", server.arg("ssid"));
 	if (server.hasArg("password")) preferences.putString("password", server.arg("password"));
+	if (server.hasArg("name")) name = server.arg("name");
 	if (server.hasArg("nickname")) nickname = server.arg("nickname");
+	if (server.hasArg("bio")) bio = server.arg("bio");
 	if (server.hasArg("note")) note = server.arg("note");
 	if (server.hasArg("status")) statusText = server.arg("status");
 	if (server.hasArg("qq")) qq = server.arg("qq");
 	if (server.hasArg("wx")) wx = server.arg("wx");
 	saveProfile();
-	server.send(200, "text/plain; charset=utf-8", "已保存，设备将在 2 秒后重启");
+	server.send(200, "text/plain; charset=utf-8", "已保存，设备将在 2 秒后重启喵");
+	delay(2000);
+	ESP.restart();
+}
+
+void handleWifiReset() {
+	preferences.remove("ssid");
+	preferences.remove("password");
+	server.send(200, "text/plain; charset=utf-8", "WLAN 配置已清除，设备将在 2 秒后重启");
 	delay(2000);
 	ESP.restart();
 }
@@ -199,7 +272,9 @@ void handleProfile() {
 			sendJson(400, "{\"error\":\"invalid json\"}");
 			return;
 		}
+		if (document.containsKey("name")) name = document["name"].as<String>();
 		if (document.containsKey("nickname")) nickname = document["nickname"].as<String>();
+		if (document.containsKey("bio")) bio = document["bio"].as<String>();
 		if (document.containsKey("note")) note = document["note"].as<String>();
 		if (document.containsKey("status")) statusText = document["status"].as<String>();
 		if (document.containsKey("qq")) qq = document["qq"].as<String>();
@@ -210,15 +285,10 @@ void handleProfile() {
 }
 
 void cleanupNearbyDevices() {
-	uint32_t now = millis();
-	for (NearbyDevice& nearby : nearbyDevices) {
-		if (!nearby.deviceId.isEmpty() && now - nearby.lastSeen > NEARBY_DEVICE_TIMEOUT_MS) {
-			nearby = NearbyDevice();
-		}
-	}
+	// Nearby profiles are persistent and remain visible until replaced.
 }
 
-void updateNearbyDevice(const String& foundId, const String& foundNickname, const String& foundStatus,
+void updateNearbyDevice(const String& foundId, const String& foundName, const String& foundNickname, const String& foundBio, const String& foundStatus,
 	const String& foundNote = "", const String& foundQq = "", const String& foundWx = "") {
 	if (foundId.isEmpty() || foundId == deviceId) return;
 	cleanupNearbyDevices();
@@ -226,12 +296,16 @@ void updateNearbyDevice(const String& foundId, const String& foundNickname, cons
 	NearbyDevice* oldest = &nearbyDevices[0];
 	for (NearbyDevice& nearby : nearbyDevices) {
 		if (nearby.deviceId == foundId) {
+			uint8_t index = static_cast<uint8_t>(&nearby - nearbyDevices);
+			nearby.name = foundName;
 			nearby.nickname = foundNickname;
+			nearby.bio = foundBio;
 			nearby.status = foundStatus;
 			nearby.note = foundNote;
 			nearby.qq = foundQq;
 			nearby.wx = foundWx;
 			nearby.lastSeen = millis();
+			saveNearbyDevice(index);
 			return;
 		}
 		if (nearby.deviceId.isEmpty() && freeSlot == nullptr) freeSlot = &nearby;
@@ -239,16 +313,15 @@ void updateNearbyDevice(const String& foundId, const String& foundNickname, cons
 	}
 	NearbyDevice& target = freeSlot != nullptr ? *freeSlot : *oldest;
 	target.deviceId = foundId;
+	target.name = foundName;
 	target.nickname = foundNickname;
+	target.bio = foundBio;
 	target.status = foundStatus;
 	target.note = foundNote;
 	target.qq = foundQq;
 	target.wx = foundWx;
 	target.lastSeen = millis();
-}
-
-void onOtherDeviceProfile(const String& topic, const String& payload) {
-	Serial.printf("收到设备资料 %s: %s\n", topic.c_str(), payload.c_str());
+	saveNearbyDevice(static_cast<uint8_t>(&target - nearbyDevices));
 }
 
 void copyToEspNowField(char* destination, size_t size, const String& value) {
@@ -258,9 +331,11 @@ void copyToEspNowField(char* destination, size_t size, const String& value) {
 EspNowProfile localEspNowProfile() {
 	EspNowProfile profile{};
 	profile.magic = ESP_NOW_MAGIC;
-	profile.version = 1;
+	profile.version = 3;
 	copyToEspNowField(profile.deviceId, sizeof(profile.deviceId), deviceId);
+	copyToEspNowField(profile.name, sizeof(profile.name), name);
 	copyToEspNowField(profile.nickname, sizeof(profile.nickname), nickname);
+	copyToEspNowField(profile.bio, sizeof(profile.bio), bio);
 	copyToEspNowField(profile.status, sizeof(profile.status), statusText);
 	copyToEspNowField(profile.note, sizeof(profile.note), note);
 	copyToEspNowField(profile.qq, sizeof(profile.qq), qq);
@@ -308,39 +383,18 @@ void processEspNowProfile() {
 	espNowMessagePending = false;
 	String foundId = received.deviceId;
 	if (foundId == deviceId) return;
-	updateNearbyDevice(foundId, received.nickname, received.status, received.note, received.qq, received.wx);
+	updateNearbyDevice(foundId, received.name, received.nickname, received.bio, received.status, received.note, received.qq, received.wx);
 	Serial.printf("离线交换设备资料: %s (%s)\n", foundId.c_str(), received.status);
-}
-
-void startConfigAccessPoint() {
-	String apName = "ESP32-" + deviceId.substring(deviceId.length() - 6);
-	WiFi.mode(WIFI_AP_STA);
-	WiFi.softAP(apName.c_str(), nullptr, ESP_NOW_CHANNEL);
-	Serial.printf("未配置 WiFi，请连接热点 %s，打开 http://%s/\n", apName.c_str(), WiFi.softAPIP().toString().c_str());
-}
-
-void connectWiFi() {
-	if (wifiSsid.isEmpty()) {
-		startConfigAccessPoint();
-		return;
-	}
-	WiFi.mode(WIFI_STA);
-	WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-	Serial.printf("正在连接 WiFi: %s", wifiSsid.c_str());
-	uint32_t started = millis();
-	while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
-		delay(300);
-		Serial.print('.');
-	}
-	Serial.println();
-	if (WiFi.status() == WL_CONNECTED) Serial.println("WiFi 已连接: " + WiFi.localIP().toString());
-	else startConfigAccessPoint();
 }
 
 void publishProfile() {
 	if (!mqtt.connected()) return;
 	String topic = mqttRoot + "/" + deviceId + "/profile";
 	mqtt.publish(topic.c_str(), profileJson().c_str(), true);
+}
+
+void onOtherDeviceProfile(const String& topic, const String& payload) {
+	Serial.printf("收到设备资料 %s: %s\n", topic.c_str(), payload.c_str());
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -353,7 +407,9 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 		return;
 	}
 	if (deserializeJson(document, input)) return;
+	if (document.containsKey("name")) name = document["name"].as<String>();
 	if (document.containsKey("nickname")) nickname = document["nickname"].as<String>();
+	if (document.containsKey("bio")) bio = document["bio"].as<String>();
 	if (document.containsKey("note")) note = document["note"].as<String>();
 	if (document.containsKey("status")) statusText = document["status"].as<String>();
 	saveProfile();
@@ -391,35 +447,38 @@ void startBleBroadcast() {
 void scanBle() {
 	if (!bleScan) return;
 	BLEScanResults results = bleScan->start(4, false);
-	String topic = mqttRoot + "/" + deviceId + "/nearby";
-	String payload = "[";
 	for (int index = 0; index < results.getCount(); index++) {
 		BLEAdvertisedDevice device = results.getDevice(index);
-		if (device.haveManufacturerData()) {
-			String data = device.getManufacturerData().c_str();
-			if (data.startsWith("P|")) {
-				int separator = data.indexOf('|', 2);
-				if (separator > 2) {
-					String foundId = data.substring(2, separator);
-					if (foundId != deviceId) {
-						String foundNickname = device.haveName() ? device.getName().c_str() : "";
-						String foundStatus = data.substring(separator + 1);
-						updateNearbyDevice(foundId, foundNickname, foundStatus);
-						Serial.printf("发现附近设备 %s (%s)\n", foundId.c_str(), foundStatus.c_str());
-					}
-				}
-			}
-		}
-		if (index) payload += ',';
-		payload += "{\"address\":\"";
-		payload += device.getAddress().toString().c_str();
-		payload += "\",\"rssi\":";
-		payload += String(device.getRSSI());
-		payload += "}";
+		if (!device.haveManufacturerData()) continue;
+		String data = device.getManufacturerData().c_str();
+		if (!data.startsWith("P|")) continue;
+		int separator = data.indexOf('|', 2);
+		if (separator <= 2) continue;
+		String foundId = data.substring(2, separator);
+		if (foundId == deviceId) continue;
+		String foundNickname = device.haveName() ? device.getName().c_str() : "";
+		String foundStatus = data.substring(separator + 1);
+		updateNearbyDevice(foundId, "", foundNickname, "", foundStatus);
+		Serial.printf("发现附近设备 %s (%s)\n", foundId.c_str(), foundStatus.c_str());
 	}
-	payload += ']';
-	if (mqtt.connected()) mqtt.publish(topic.c_str(), payload.c_str());
 	bleScan->clearResults();
+}
+
+void startConfigAccessPoint() {
+	String apName = "ESP32-" + deviceId.substring(deviceId.length() - 6);
+	IPAddress apIp(192, 168, 4, 1);
+	IPAddress gateway(192, 168, 4, 1);
+	IPAddress subnet(255, 255, 255, 0);
+	WiFi.mode(WIFI_AP);
+	WiFi.setSleep(false);
+	WiFi.softAPConfig(apIp, gateway, subnet);
+	bool started = WiFi.softAP(apName.c_str(), "12345678", ESP_NOW_CHANNEL, false, 4);
+	Serial.printf("配置热点 %s，信道 %u，启动%s，地址 http://%s/\n", apName.c_str(), ESP_NOW_CHANNEL,
+		started ? "成功" : "失败", WiFi.softAPIP().toString().c_str());
+}
+
+void connectWiFi() {
+	startConfigAccessPoint();
 }
 
 void setup() {
@@ -428,6 +487,7 @@ void setup() {
 	connectWiFi();
 	server.on("/", HTTP_GET, handleRoot);
 	server.on("/api/profile", HTTP_ANY, handleProfile);
+	server.on("/api/reset-wlan", HTTP_POST, handleWifiReset);
 	server.on("/api/devices", HTTP_GET, []() {
 		cleanupNearbyDevices();
 		sendJson(200, profileJson(true));
